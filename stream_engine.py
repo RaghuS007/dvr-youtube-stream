@@ -1011,6 +1011,7 @@ class Engine:
     def _sink_loop(self) -> None:
         backoff = 2
         retry_at = 0.0
+        last_stat_log = 0.0
         while self.running:
             now = time.monotonic()
             s = self.sink
@@ -1022,6 +1023,14 @@ class Engine:
                     if s.last_progress and now - s.t0 > 60:
                         backoff = 2
                     self.sink_status = "live" if s.last_progress and now - s.last_progress < 5 else "connecting"
+                    if s.last_progress and now - last_stat_log >= 60:
+                        last_stat_log = now
+                        fps = s.stats.get("fps", "").strip()
+                        speed = s.stats.get("speed", "").strip()
+                        br = s.stats.get("bitrate", "").strip()
+                        uptime_s = int(now - s.t0)
+                        log.info("Streaming to YouTube: uptime=%ds, bitrate=%s, speed=%s, fps=%s",
+                                 uptime_s, br, speed, fps)
                 time.sleep(0.5)
                 continue
             if s and not s.handled:
@@ -1088,7 +1097,7 @@ class Engine:
                 time.sleep(delay)
             a = self.active
             data = a.pop_audio(AUDIO_CHUNK) if a and a.has_audio else None
-            if data is None or self.audio_muted(a.channel):
+            if data is None or self.audio_muted(a.channel if a else None):
                 data = SILENCE   # popping anyway keeps the camera's buffer fresh
             try:
                 s.write_audio(data)
