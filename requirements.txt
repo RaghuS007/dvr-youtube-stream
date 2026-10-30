@@ -1,0 +1,10 @@
+# DVR to YouTube Stream
+# Core functionality relies entirely on Python standard library (3.10+) and FFmpeg (6.0+).
+# Optional development, testing, and system tray packages:
+
+# Testing & Linting
+pytest>=8.0.0
+
+# Optional: System Tray support (for future headless/tray daemon)
+# pystray>=0.19.5
+# Pillow>=10.0.0

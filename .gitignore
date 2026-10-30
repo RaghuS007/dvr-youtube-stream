@@ -1,0 +1,28 @@
+# Security: Never commit live configuration with passwords & stream keys
+config.ini
+*.ini.bak
+*.ini.tmp
+
+# Logs
+logs/
+*.log
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE & OS metadata
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+*.lnk
