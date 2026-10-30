@@ -122,4 +122,178 @@ def test_osd_defaults():
     assert cfg["osd"]["enabled"] == "false"
     assert cfg["osd"]["show_channel"] == "true"
     assert cfg["osd"]["show_time"] == "true"
+    assert cfg["osd"]["show_temp"] == "true"
+    assert cfg["osd"]["weather_location"] == "auto"
     assert cfg["encoder"]["video_codec"] == "h264_qsv"
+
+
+def test_osd_temperature_settings_roundtrip(tmp_path: Path):
+    test_ini = tmp_path / "test_config.ini"
+    cfg = se.load_settings(test_ini)
+    assert cfg["osd"]["show_temp"] == "true"
+    assert cfg["osd"]["weather_location"] == "auto"
+
+    cfg["osd"]["show_temp"] = "false"
+    cfg["osd"]["weather_location"] = "London"
+    se.save_settings(cfg, test_ini)
+
+    reloaded = se.load_settings(test_ini)
+    assert reloaded["osd"]["show_temp"] == "false"
+    assert reloaded["osd"]["weather_location"] == "London"
+
+
+def test_fetch_temperature_open_meteo(monkeypatch):
+    import io
+
+    class MockResponse:
+        def __init__(self, data: bytes):
+            self.data = data
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return self.data
+
+    def mock_urlopen(req, timeout=5):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "open-meteo.com" in url:
+            return MockResponse(b'{"current": {"temperature_2m": 24.3}}')
+        raise RuntimeError("Unexpected URL")
+
+    monkeypatch.setattr(se.urllib.request, "urlopen", mock_urlopen)
+    temp = se.fetch_temperature("12.97,77.59")
+    assert temp == "24\u00b0C"
+
+
+def test_fetch_temperature_wttr_fallback(monkeypatch):
+    class MockResponse:
+        def __init__(self, data: bytes):
+            self.data = data
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return self.data
+
+    def mock_urlopen(req, timeout=5):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "open-meteo" in url:
+            raise se.urllib.error.URLError("Network unreachable")
+        if "wttr.in" in url:
+            return MockResponse(b"+27\xc2\xb0C\n")
+        raise RuntimeError("Unexpected URL")
+
+    monkeypatch.setattr(se.urllib.request, "urlopen", mock_urlopen)
+    temp = se.fetch_temperature("London")
+    assert temp == "27\u00b0C"
+
+
+def test_fetch_temperature_error(monkeypatch):
+    def mock_urlopen(req, timeout=5):
+        raise se.urllib.error.URLError("Network unreachable")
+
+    monkeypatch.setattr(se.urllib.request, "urlopen", mock_urlopen)
+    assert se.fetch_temperature("auto") is None
+
+
+def test_engine_update_osd_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(se, "find_tool", lambda cfg, name: name)
+    monkeypatch.setattr(se, "LOG_DIR", tmp_path)
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read_dict(se.DEFAULTS)
+    cfg["osd"]["enabled"] = "true"
+    cfg["osd"]["show_time"] = "true"
+    cfg["osd"]["show_temp"] = "true"
+
+    eng = se.Engine(cfg)
+    eng.osd_file = tmp_path / "osd_time_temp.txt"
+
+    # Initially no temp fetched yet -> time only
+    eng.update_osd_file()
+    assert eng.osd_file.read_text(encoding="utf-8") == "%{localtime}"
+
+    # After temp is fetched -> time + temp
+    eng.current_temp = "28\u00b0C"
+    eng.update_osd_file()
+    assert eng.osd_file.read_text(encoding="utf-8") == "%{localtime}  \u00b7  28\u00b0C"
+
+    # With show_time=false
+    eng.cfg["osd"]["show_time"] = "false"
+    eng.update_osd_file()
+    assert eng.osd_file.read_text(encoding="utf-8") == "28\u00b0C"
+
+
+def test_worker_osd_vf_filter(monkeypatch, tmp_path):
+    monkeypatch.setattr(se, "find_tool", lambda cfg, name: name)
+    monkeypatch.setattr(se, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(se, "probe", lambda cfg, ffprobe, ch, timeout=10: {
+        "ok": True, "reason": "", "video": "h264", "audio": None, "width": 1920, "height": 1080
+    })
+
+    captured_cmds = []
+    class DummyProc:
+        def __init__(self, cmd, *args, **kwargs):
+            captured_cmds.append(cmd)
+            self.stdout = None
+            self.stderr = []
+            self.returncode = 0
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(se.subprocess, "Popen", DummyProc)
+    monkeypatch.setattr(se.InputSource, "_read_video", lambda self, size: None)
+
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read_dict(se.DEFAULTS)
+    cfg["osd"]["enabled"] = "true"
+    cfg["osd"]["show_channel"] = "true"
+    cfg["osd"]["show_time"] = "true"
+    cfg["osd"]["show_temp"] = "true"
+
+    eng = se.Engine(cfg)
+    eng.osd_file = tmp_path / "osd_time_temp.txt"
+    worker = se.InputSource(eng, 1)
+
+    import time
+    for _ in range(20):
+        if captured_cmds:
+            break
+        time.sleep(0.05)
+
+    assert len(captured_cmds) == 1
+    vf_arg = captured_cmds[0][captured_cmds[0].index("-vf") + 1]
+    assert "textfile=" in vf_arg
+    assert "reload=1" in vf_arg
+
+
+def test_muted_channels_roundtrip(tmp_path: Path):
+    test_ini = tmp_path / "test_config.ini"
+    cfg = se.load_settings(test_ini)
+    assert cfg["audio"]["muted_channels"] == ""
+
+    cfg["audio"]["muted_channels"] = "3,5"
+    se.save_settings(cfg, test_ini)
+    reloaded = se.load_settings(test_ini)
+    assert se.parse_channels(reloaded["audio"]["muted_channels"]) == [3, 5]
+
+
+def test_engine_channel_mute(monkeypatch):
+    monkeypatch.setattr(se, "find_tool", lambda cfg, name: name)
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read_dict(se.DEFAULTS)
+    cfg["audio"]["muted_channels"] = "2"
+    eng = se.Engine(cfg)
+
+    assert eng.audio_muted(2)
+    assert not eng.audio_muted(1)
+
+    eng.set_channel_muted(1, True)
+    eng.set_channel_muted(2, False)
+    assert eng.audio_muted(1)
+    assert not eng.audio_muted(2)
+
+    # The global switch overrides per-channel settings
+    eng.set_audio(False)
+    assert eng.audio_muted(2)

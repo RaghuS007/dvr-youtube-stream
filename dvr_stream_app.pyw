@@ -100,8 +100,11 @@ class App(tk.Tk):
                         variable=self.audio_var, command=self.on_audio).pack(side="left")
         osd_sec = self.cfg["osd"] if self.cfg.has_section("osd") else {}
         self.osd_var = tk.BooleanVar(value=osd_sec.getboolean("enabled", False) if hasattr(osd_sec, "getboolean") else False)
-        ttk.Checkbutton(row_ao, text="Burn camera name & live clock onto video (OSD)",
+        ttk.Checkbutton(row_ao, text="Burn camera name, live clock & temp onto video (OSD)",
                         variable=self.osd_var, command=self.on_osd).pack(side="left", padx=20)
+        ttk.Label(of, text="Mute audio on these channels:").pack(anchor="w", padx=6)
+        self.mute_frame = ttk.Frame(of)
+        self.mute_frame.pack(anchor="w", padx=6, pady=(0, 6))
 
         sf = ttk.LabelFrame(self, text="Auto-switching")
         sf.pack(fill="x", **pad)
@@ -137,7 +140,7 @@ class App(tk.Tk):
         self._build_channels()
 
     def _build_channels(self):
-        for frame in (self.ch_frame, self.auto_frame):
+        for frame in (self.ch_frame, self.auto_frame, self.mute_frame):
             for w in frame.winfo_children():
                 w.destroy()
         n = max(1, self.cfg["dvr"].getint("channels", 8))
@@ -157,6 +160,14 @@ class App(tk.Tk):
             ttk.Checkbutton(self.auto_frame, text=str(ch), variable=v, command=self.on_switching
                             ).grid(row=(ch - 1) // 8, column=(ch - 1) % 8, padx=4)
             self.auto_vars[ch] = v
+        muted = set(se.parse_channels(self.cfg["audio"].get("muted_channels", "")))
+        self.mute_vars = {}
+        for ch in range(1, n + 1):
+            v = tk.BooleanVar(value=ch in muted)
+            ttk.Checkbutton(self.mute_frame, text=str(ch), variable=v,
+                            command=lambda c=ch: self.on_channel_mute(c)
+                            ).grid(row=(ch - 1) // 8, column=(ch - 1) % 8, padx=4)
+            self.mute_vars[ch] = v
 
     # ------------------------------------------------------------- actions --
     def _save(self):
@@ -206,12 +217,25 @@ class App(tk.Tk):
         else:
             log.info("Audio will be %s", "ON" if on else "OFF")
 
+    def on_channel_mute(self, ch: int):
+        muted = self.mute_vars[ch].get()
+        chans = [c for c, v in self.mute_vars.items() if v.get()]
+        self.cfg["audio"]["muted_channels"] = ",".join(map(str, chans))
+        self._save()
+        if self.engine:
+            self.engine.set_channel_muted(ch, muted)
+        else:
+            log.info("Channel %s audio will be %s", se.channel_label(self.cfg, ch),
+                     "MUTED" if muted else "unmuted")
+
     def on_osd(self):
         on = self.osd_var.get()
         if not self.cfg.has_section("osd"):
             self.cfg.add_section("osd")
         self.cfg["osd"]["enabled"] = "true" if on else "false"
         self._save()
+        if self.engine:
+            self.engine.set_osd(on)
         log.info("On-Screen Display (OSD) set to %s (applies on next channel switch)", "ON" if on else "OFF")
 
     def on_switching(self, *_):
@@ -305,8 +329,12 @@ class App(tk.Tk):
                 parts.append(f"up {fmt_uptime(st['uptime'])}")
             if not st["audio"]:
                 parts.append("audio OFF")
+            elif st["muted"]:
+                parts.append("channel muted")
             elif st["active"] and not st["has_audio"]:
                 parts.append("camera has no audio")
+            if st.get("temp"):
+                parts.append(st["temp"])
             self.detail_lbl.config(text="  ·  ".join(parts))
             health, active, pending = st["health"], st["active"], st["pending"]
         else:
@@ -349,6 +377,8 @@ class SettingsDialog(tk.Toplevel):
         ("encoder", "video_bitrate", "Video bitrate", "combo", ["1500k", "2500k", "3000k", "4500k", "6000k"]),
         ("encoder", "video_codec", "Encoder", "combo", list(DEFAULT_PRESETS)),
         ("osd", "enabled", "Burn camera name/clock on stream (OSD)", "combo", ["false", "true"]),
+        ("osd", "show_temp", "Show temperature on OSD (°C)", "combo", ["true", "false"]),
+        ("osd", "weather_location", "Weather location (city, lat,lon, or auto)", "entry", None),
         ("switching", "failover_after", "Channel fails after (s without video)", "entry", None),
         ("switching", "failback_seconds", "Failover: retry main channel every (s)", "entry", None),
     ]

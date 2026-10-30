@@ -23,11 +23,14 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import shutil
+import sys
 import socket
 import subprocess
 import threading
 import time
+import urllib.request
 from collections import deque
 from pathlib import Path
 from urllib.parse import quote
@@ -70,8 +73,9 @@ DEFAULTS = {
     "switching": {"channel": "7", "mode": "off", "rotate_seconds": "30",
                   "auto_channels": "1,2,3,4,5,6,7,8", "failover_after": "10",
                   "failback_seconds": "60"},
-    "audio": {"enabled": "true"},
-    "osd": {"enabled": "false", "show_channel": "true", "show_time": "true", "font_size": "22"},
+    "audio": {"enabled": "true", "muted_channels": ""},
+    "osd": {"enabled": "false", "show_channel": "true", "show_time": "true",
+            "show_temp": "true", "weather_location": "auto", "font_size": "22"},
     "tools": {"ffmpeg": "", "ffprobe": ""},
 }
 
@@ -121,13 +125,17 @@ failback_seconds = {switching[failback_seconds]}
 
 [audio]
 enabled = {audio[enabled]}
+# Channels whose camera audio is replaced by silence, comma-separated (e.g. 3,5).
+muted_channels = {audio[muted_channels]}
 
 [osd]
-# Burn camera label and live clock into the video stream (true | false)
-enabled      = {osd[enabled]}
-show_channel = {osd[show_channel]}
-show_time    = {osd[show_time]}
-font_size    = {osd[font_size]}
+# Burn camera label, live clock, and live weather temperature into the video stream (true | false)
+enabled          = {osd[enabled]}
+show_channel     = {osd[show_channel]}
+show_time        = {osd[show_time]}
+show_temp        = {osd[show_temp]}
+weather_location = {osd[weather_location]}
+font_size        = {osd[font_size]}
 
 [tools]
 # Leave empty to use ffmpeg/ffprobe from PATH.
@@ -265,6 +273,77 @@ def setup_logging(*handlers: logging.Handler) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Weather / Temperature for OSD
+# --------------------------------------------------------------------------- #
+def fetch_temperature(location: str = "auto", timeout: int = 5) -> str | None:
+    """Fetch current outdoor temperature in degrees Celsius (°C).
+
+    Supports:
+      - 'auto': Geolocation by public IP -> Open-Meteo current forecast, with wttr.in fallback.
+      - City name (e.g. 'London', 'Bengaluru'): Open-Meteo geocoding -> forecast, with wttr.in fallback.
+      - 'lat,lon' coordinates (e.g. '12.97,77.59'): Direct Open-Meteo forecast.
+    """
+    location = (location or "auto").strip()
+    headers = {"User-Agent": "DVR-YouTube-Stream/2.0"}
+    lat, lon = None, None
+
+    if "," in location:
+        parts = location.split(",")
+        try:
+            lat, lon = float(parts[0].strip()), float(parts[1].strip())
+        except ValueError:
+            pass
+    elif location.lower() == "auto":
+        try:
+            req = urllib.request.Request("http://ip-api.com/json/", headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                lat, lon = data.get("lat"), data.get("lon")
+        except Exception:
+            pass
+    else:
+        try:
+            geo_url = (f"https://geocoding-api.open-meteo.com/v1/search?"
+                       f"name={quote(location)}&count=1")
+            req = urllib.request.Request(geo_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                results = data.get("results") or []
+                if results:
+                    lat, lon = results[0].get("latitude"), results[0].get("longitude")
+        except Exception:
+            pass
+
+    if lat is not None and lon is not None:
+        try:
+            url = (f"https://api.open-meteo.com/v1/forecast?"
+                   f"latitude={lat}&longitude={lon}&current=temperature_2m")
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                temp = data["current"]["temperature_2m"]
+                return f"{round(float(temp))}°C"
+        except Exception:
+            pass
+
+    # Fallback to wttr.in
+    try:
+        wttr_loc = "" if location.lower() == "auto" else quote(location)
+        url = f"https://wttr.in/{wttr_loc}?format=%t"
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", "replace").strip().lstrip("+")
+            m = re.search(r"(-?\d+(?:\.\d+)?)\s*°?C?", text)
+            if m:
+                val = round(float(m.group(1)))
+                return f"{val}°C"
+    except Exception:
+        pass
+
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Probing
 # --------------------------------------------------------------------------- #
 def probe(cfg, ffprobe: str, channel: int, timeout: int = 10) -> dict:
@@ -384,11 +463,21 @@ class InputSource:
                     f"drawtext={fontfile_param}text='{ch_label}':fontcolor=white:fontsize={font_size}"
                     f":box=1:boxcolor=black@0.6:boxborderw=6:x=16:y=16"
                 )
-            if osd.get("show_time", "true").lower() in ("true", "1", "yes"):
-                vf_filters.append(
-                    f"drawtext={fontfile_param}text='%{{localtime}}':fontcolor=white:fontsize={font_size}"
-                    f":box=1:boxcolor=black@0.6:boxborderw=6:x=w-tw-16:y=16"
-                )
+            show_time = osd.get("show_time", "true").lower() in ("true", "1", "yes")
+            show_temp = osd.get("show_temp", "true").lower() in ("true", "1", "yes")
+            if show_time or show_temp:
+                if show_temp:
+                    eng.update_osd_file()
+                    escaped_osd = str(eng.osd_file).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+                    vf_filters.append(
+                        f"drawtext={fontfile_param}textfile='{escaped_osd}':reload=1:fontcolor=white:fontsize={font_size}"
+                        f":box=1:boxcolor=black@0.6:boxborderw=6:x=w-tw-16:y=16"
+                    )
+                else:
+                    vf_filters.append(
+                        f"drawtext={fontfile_param}text='%{{localtime}}':fontcolor=white:fontsize={font_size}"
+                        f":box=1:boxcolor=black@0.6:boxborderw=6:x=w-tw-16:y=16"
+                    )
         vf_filters.append("format=yuv420p")
         vf = ",".join(vf_filters)
         cmd = [eng.ffmpeg, "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
@@ -658,6 +747,7 @@ class Engine:
         self.failover_after = max(3, sw.getint("failover_after", 10))
         self.failback_seconds = max(10, sw.getint("failback_seconds", 60))
         self.audio_enabled = cfg["audio"].getboolean("enabled", True)
+        self.muted_channels = set(parse_channels(cfg["audio"].get("muted_channels", "")))
 
         self.audio_cache: dict[int, bool] = {}      # channel -> has an audio track
         self.channel_health: dict[int, str] = {}    # channel -> "ok" | "fail"
@@ -671,18 +761,30 @@ class Engine:
         self._retry_at: dict[int, float] = {}
         self._fail_count: dict[int, int] = {}
         self._last_failback = 0.0
+        self.osd_file = LOG_DIR / "osd_time_temp.txt"
+        self.current_temp: str | None = None
+        self._osd_lock = threading.Lock()
+        self._weather_thread: threading.Thread | None = None
         set_secrets(cfg)
+        self.update_osd_file()
 
     # ---- public controls (thread-safe enough: simple attribute swaps) ----
     def start(self) -> None:
         if not self.cfg["youtube"]["stream_key"].strip():
             raise ValueError("Set your YouTube stream key in Settings first.")
         self.running = True
-        log.info("Starting: main channel %d, auto-switch %s, audio %s, output %dx%d@%d",
+        log.info("Starting: main channel %d, auto-switch %s, audio %s%s, output %dx%d@%d",
                  self.selected, self.mode, "on" if self.audio_enabled else "off",
-                 *self.canvas, self.fps)
+                 f" (muted: {','.join(map(str, sorted(self.muted_channels)))})"
+                 if self.muted_channels else "", *self.canvas, self.fps)
         for target in (self._control_loop, self._sink_loop, self._video_writer, self._audio_writer):
             threading.Thread(target=target, daemon=True, name=target.__name__).start()
+        osd = self.cfg["osd"] if self.cfg.has_section("osd") else {}
+        osd_on = osd.get("enabled", "false").lower() in ("true", "1", "yes")
+        show_temp = osd.get("show_temp", "true").lower() in ("true", "1", "yes")
+        if osd_on and show_temp and (not self._weather_thread or not self._weather_thread.is_alive()):
+            self._weather_thread = threading.Thread(target=self._weather_loop, daemon=True, name="weather_loop")
+            self._weather_thread.start()
 
     def stop(self) -> None:
         self.running = False
@@ -703,6 +805,17 @@ class Engine:
         self.audio_enabled = on
         log.info("Audio %s", "ON" if on else "OFF (sending silence)")
 
+    def set_channel_muted(self, ch: int, muted: bool) -> None:
+        if muted:
+            self.muted_channels = self.muted_channels | {ch}
+        else:
+            self.muted_channels = self.muted_channels - {ch}
+        log.info("Channel %s audio %s", channel_label(self.cfg, ch), "MUTED" if muted else "unmuted")
+
+    def audio_muted(self, ch: int | None) -> bool:
+        """True when the given on-air channel must send silence instead of its audio."""
+        return not self.audio_enabled or ch in self.muted_channels
+
     def set_switching(self, mode: str, rotate_seconds: int, channels: list[int]) -> None:
         changed = mode != self.mode
         self.mode = mode
@@ -713,17 +826,77 @@ class Engine:
             log.info("Auto-switching: %s", {"off": "off", "failover": "failover",
                                             "rotate": f"rotate every {self.rotate_seconds}s"}[mode])
 
+    def update_osd_file(self) -> None:
+        """Atomically update the badge text file read by FFmpeg drawtext."""
+        osd = self.cfg["osd"] if self.cfg.has_section("osd") else {}
+        show_time = osd.get("show_time", "true").lower() in ("true", "1", "yes")
+        show_temp = osd.get("show_temp", "true").lower() in ("true", "1", "yes")
+
+        parts = []
+        if show_time:
+            parts.append("%{localtime}")
+        if show_temp and self.current_temp:
+            parts.append(self.current_temp)
+
+        content = "  ·  ".join(parts) if parts else " "
+
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = self.osd_file.with_suffix(".tmp")
+            with self._osd_lock:
+                tmp.write_text(content, encoding="utf-8")
+                os.replace(tmp, self.osd_file)
+        except OSError as e:
+            log.warning("Failed to write OSD badge file: %s", e)
+
+    def set_osd(self, on: bool) -> None:
+        if not self.cfg.has_section("osd"):
+            self.cfg.add_section("osd")
+        self.cfg["osd"]["enabled"] = "true" if on else "false"
+        self.update_osd_file()
+        show_temp = self.cfg["osd"].get("show_temp", "true").lower() in ("true", "1", "yes")
+        if on and show_temp and self.running and (not self._weather_thread or not self._weather_thread.is_alive()):
+            self._weather_thread = threading.Thread(target=self._weather_loop, daemon=True, name="weather_loop")
+            self._weather_thread.start()
+
+    def _weather_loop(self) -> None:
+        """Periodically fetch outdoor temperature and update the OSD badge."""
+        while self.running:
+            osd = self.cfg["osd"] if self.cfg.has_section("osd") else {}
+            osd_on = osd.get("enabled", "false").lower() in ("true", "1", "yes")
+            show_temp = osd.get("show_temp", "true").lower() in ("true", "1", "yes")
+            if not (osd_on and show_temp):
+                time.sleep(2)
+                continue
+
+            loc = osd.get("weather_location", "auto")
+            temp = fetch_temperature(loc)
+            if temp:
+                self.current_temp = temp
+                self.update_osd_file()
+                log.info("OSD temperature updated: %s (location: %s)", temp, loc)
+                sleep_s = 600
+            else:
+                sleep_s = 30  # retry sooner if fetch failed
+
+            for _ in range(int(sleep_s)):
+                if not self.running:
+                    break
+                time.sleep(1)
+
     def status(self) -> dict:
         now = time.monotonic()
         a, p, s = self.active, self.pending, self.sink
         st = {"running": self.running, "output": self.sink_status,
               "active": a.channel if a else None, "pending": p.channel if p else None,
               "has_audio": bool(a and a.has_audio), "audio": self.audio_enabled,
+              "muted": bool(a and a.channel in self.muted_channels),
+              "temp": self.current_temp,
               "selected": self.selected, "health": dict(self.channel_health),
               "uptime": 0, "bitrate": "", "speed": ""}
         if s and s.alive and s.t0:
             st.update(uptime=now - s.t0, bitrate=s.stats.get("bitrate", "").strip(),
-                      speed=s.stats.get("speed", "").strip())
+                       speed=s.stats.get("speed", "").strip())
         return st
 
     # ---- channel control ----
@@ -915,7 +1088,7 @@ class Engine:
                 time.sleep(delay)
             a = self.active
             data = a.pop_audio(AUDIO_CHUNK) if a and a.has_audio else None
-            if not self.audio_enabled or data is None:
+            if data is None or self.audio_muted(a.channel):
                 data = SILENCE   # popping anyway keeps the camera's buffer fresh
             try:
                 s.write_audio(data)
@@ -937,6 +1110,9 @@ def main() -> None:
     parser.add_argument("--mode", choices=["off", "failover", "rotate"], help="Override switching mode")
     parser.add_argument("--rotate-seconds", type=int, help="Rotation period in seconds")
     parser.add_argument("--no-audio", action="store_true", help="Force mute / stream silence")
+    parser.add_argument("--mute-channels", help="Comma-separated channels to stream without audio")
+    parser.add_argument("--no-temp", action="store_true", help="Disable temperature overlay in OSD")
+    parser.add_argument("--weather-location", help="Weather location (city name, lat,lon, or 'auto')")
     parser.add_argument("--probe", action="store_true", help="Probe all channels and exit")
     args = parser.parse_args()
 
@@ -952,6 +1128,16 @@ def main() -> None:
         cfg["switching"]["rotate_seconds"] = str(args.rotate_seconds)
     if args.no_audio:
         cfg["audio"]["enabled"] = "false"
+    if args.mute_channels is not None:
+        cfg["audio"]["muted_channels"] = ",".join(map(str, parse_channels(args.mute_channels)))
+    if args.no_temp:
+        if not cfg.has_section("osd"):
+            cfg.add_section("osd")
+        cfg["osd"]["show_temp"] = "false"
+    if args.weather_location:
+        if not cfg.has_section("osd"):
+            cfg.add_section("osd")
+        cfg["osd"]["weather_location"] = args.weather_location
 
     if args.probe:
         try:

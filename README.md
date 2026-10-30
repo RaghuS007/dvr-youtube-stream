@@ -107,18 +107,23 @@ In `config.ini`:
 
 ## 📺 On-Screen Display (OSD) Overlay
 
-The relay can automatically burn the camera name (top-left) and live timestamp clock (top-right) with clean semi-transparent badges directly onto the video:
+The relay can automatically burn the camera name (top-left) and live timestamp clock with live outdoor weather temperature in degree Celsius (°C) (top-right) with clean semi-transparent badges directly onto the video:
 
 In `config.ini`:
 ```ini
 [osd]
-enabled      = true
-show_channel = true
-show_time    = true
-font_size    = 22
+enabled          = true
+show_channel     = true
+show_time        = true
+show_temp        = true
+# "auto" (detect by IP), city name (e.g. London, Bengaluru), or lat,lon (e.g. 12.97,77.59)
+weather_location = auto
+font_size        = 22
 ```
 
-You can also toggle OSD dynamically with one click in the desktop GUI app (`start_stream.bat --gui`).
+- **Live Temperature (°C):** Automatically queries live outdoor temperature using Open-Meteo and wttr.in without requiring any API keys.
+- **Dynamic Updates:** Temperature refreshes periodically in the background and updates seamlessly on the live stream without reconnecting or dropping frames.
+- **Desktop GUI:** Toggle OSD on/off or configure temperature settings directly in the desktop GUI app (`start_stream.bat --gui`).
 
 ---
 
