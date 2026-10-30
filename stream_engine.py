@@ -399,6 +399,7 @@ class InputSource:
         self.frames = 0
         self.last_frame_t: float | None = None
         self.has_audio = False
+        self.osd_temp: str | None = None   # temperature burned into this source's picture
         self.dead = False
         self.reason = ""
         self._stopped = False
@@ -465,19 +466,16 @@ class InputSource:
                 )
             show_time = osd.get("show_time", "true").lower() in ("true", "1", "yes")
             show_temp = osd.get("show_temp", "true").lower() in ("true", "1", "yes")
-            if show_time or show_temp:
-                if show_temp:
-                    eng.update_osd_file()
-                    escaped_osd = str(eng.osd_file).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
-                    vf_filters.append(
-                        f"drawtext={fontfile_param}textfile='{escaped_osd}':reload=1:fontcolor=white:fontsize={font_size}"
-                        f":box=1:boxcolor=black@0.6:boxborderw=6:x=w-tw-16:y=16"
-                    )
-                else:
-                    vf_filters.append(
-                        f"drawtext={fontfile_param}text='%{{localtime}}':fontcolor=white:fontsize={font_size}"
-                        f":box=1:boxcolor=black@0.6:boxborderw=6:x=w-tw-16:y=16"
-                    )
+            # The text is fixed for this ffmpeg's lifetime: drawtext's reload= treats a failed
+            # read as fatal, so a file swapped mid-read would kill the camera feed. Engine
+            # starts a fresh source when the temperature changes.
+            self.osd_temp = eng.current_temp if show_temp else None
+            parts = (["%{localtime}"] if show_time else []) + ([self.osd_temp] if self.osd_temp else [])
+            if parts:
+                vf_filters.append(
+                    f"drawtext={fontfile_param}text='{'  ·  '.join(parts)}':fontcolor=white:fontsize={font_size}"
+                    f":box=1:boxcolor=black@0.6:boxborderw=6:x=w-tw-16:y=16"
+                )
         vf_filters.append("format=yuv420p")
         vf = ",".join(vf_filters)
         cmd = [eng.ffmpeg, "-hide_banner", "-loglevel", "error", "-max_error_rate", "1.0",
@@ -761,12 +759,9 @@ class Engine:
         self._retry_at: dict[int, float] = {}
         self._fail_count: dict[int, int] = {}
         self._last_failback = 0.0
-        self.osd_file = LOG_DIR / "osd_time_temp.txt"
         self.current_temp: str | None = None
-        self._osd_lock = threading.Lock()
         self._weather_thread: threading.Thread | None = None
         set_secrets(cfg)
-        self.update_osd_file()
 
     # ---- public controls (thread-safe enough: simple attribute swaps) ----
     def start(self) -> None:
@@ -826,34 +821,10 @@ class Engine:
             log.info("Auto-switching: %s", {"off": "off", "failover": "failover",
                                             "rotate": f"rotate every {self.rotate_seconds}s"}[mode])
 
-    def update_osd_file(self) -> None:
-        """Atomically update the badge text file read by FFmpeg drawtext."""
-        osd = self.cfg["osd"] if self.cfg.has_section("osd") else {}
-        show_time = osd.get("show_time", "true").lower() in ("true", "1", "yes")
-        show_temp = osd.get("show_temp", "true").lower() in ("true", "1", "yes")
-
-        parts = []
-        if show_time:
-            parts.append("%{localtime}")
-        if show_temp and self.current_temp:
-            parts.append(self.current_temp)
-
-        content = "  ·  ".join(parts) if parts else " "
-
-        try:
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            tmp = self.osd_file.with_suffix(".tmp")
-            with self._osd_lock:
-                tmp.write_text(content, encoding="utf-8")
-                os.replace(tmp, self.osd_file)
-        except OSError as e:
-            log.warning("Failed to write OSD badge file: %s", e)
-
     def set_osd(self, on: bool) -> None:
         if not self.cfg.has_section("osd"):
             self.cfg.add_section("osd")
         self.cfg["osd"]["enabled"] = "true" if on else "false"
-        self.update_osd_file()
         show_temp = self.cfg["osd"].get("show_temp", "true").lower() in ("true", "1", "yes")
         if on and show_temp and self.running and (not self._weather_thread or not self._weather_thread.is_alive()):
             self._weather_thread = threading.Thread(target=self._weather_loop, daemon=True, name="weather_loop")
@@ -873,7 +844,6 @@ class Engine:
             temp = fetch_temperature(loc)
             if temp:
                 self.current_temp = temp
-                self.update_osd_file()
                 log.info("OSD temperature updated: %s (location: %s)", temp, loc)
                 sleep_s = 600
             else:
@@ -1006,6 +976,16 @@ class Engine:
               and self._allowed(self.selected, now)):
             self._last_failback = now
             self._begin(self.selected, "trying main channel again")
+        elif self.mode != "rotate" and self._temp_stale(a) and self._allowed(a.channel, now):
+            # Same switch as any other: the old source stays on air until the new one has a
+            # frame. Rotation needs no help, the next channel picks up the new temperature.
+            self._begin(a.channel, "temperature update")
+
+    def _temp_stale(self, src: InputSource) -> bool:
+        osd = self.cfg["osd"] if self.cfg.has_section("osd") else {}
+        return (osd.get("enabled", "false").lower() in ("true", "1", "yes")
+                and osd.get("show_temp", "true").lower() in ("true", "1", "yes")
+                and self.current_temp is not None and src.osd_temp != self.current_temp)
 
     # ---- output management ----
     def _sink_loop(self) -> None:

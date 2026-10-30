@@ -6,6 +6,7 @@ bitrate scaling, settings management, and secret redaction.
 
 from __future__ import annotations
 
+import types
 import configparser
 from pathlib import Path
 import pytest
@@ -198,36 +199,55 @@ def test_fetch_temperature_error(monkeypatch):
     assert se.fetch_temperature("auto") is None
 
 
-def test_engine_update_osd_file(monkeypatch, tmp_path):
+def _osd_engine(monkeypatch):
     monkeypatch.setattr(se, "find_tool", lambda cfg, name: name)
-    monkeypatch.setattr(se, "LOG_DIR", tmp_path)
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read_dict(se.DEFAULTS)
     cfg["osd"]["enabled"] = "true"
-    cfg["osd"]["show_time"] = "true"
-    cfg["osd"]["show_temp"] = "true"
-
-    eng = se.Engine(cfg)
-    eng.osd_file = tmp_path / "osd_time_temp.txt"
-
-    # Initially no temp fetched yet -> time only
-    eng.update_osd_file()
-    assert eng.osd_file.read_text(encoding="utf-8") == "%{localtime}"
-
-    # After temp is fetched -> time + temp
-    eng.current_temp = "28\u00b0C"
-    eng.update_osd_file()
-    assert eng.osd_file.read_text(encoding="utf-8") == "%{localtime}  \u00b7  28\u00b0C"
-
-    # With show_time=false
-    eng.cfg["osd"]["show_time"] = "false"
-    eng.update_osd_file()
-    assert eng.osd_file.read_text(encoding="utf-8") == "28\u00b0C"
+    return se.Engine(cfg)
 
 
-def test_worker_osd_vf_filter(monkeypatch, tmp_path):
+def test_temp_stale(monkeypatch):
+    eng = _osd_engine(monkeypatch)
+    src = types.SimpleNamespace(osd_temp=None)
+
+    # Nothing fetched yet -> nothing to refresh
+    assert not eng._temp_stale(src)
+
+    eng.current_temp = "28°C"
+    assert eng._temp_stale(src)
+
+    src.osd_temp = "28°C"
+    assert not eng._temp_stale(src)
+
+    src.osd_temp = "27°C"
+    assert eng._temp_stale(src)
+    eng.cfg["osd"]["show_temp"] = "false"
+    assert not eng._temp_stale(src)
+
+
+def test_control_step_refreshes_temperature(monkeypatch):
+    eng = _osd_engine(monkeypatch)
+    begun = []
+    monkeypatch.setattr(eng, "_begin", lambda ch, why: begun.append((ch, why)))
+    eng.current_temp = "28°C"
+    eng.active = types.SimpleNamespace(channel=7, osd_temp="27°C", dead=False,
+                                       stalled_for=lambda now: 0)
+    eng.active_since = 100.0
+    eng.selected = 7
+
+    # Rotation picks the temperature up on its next switch, no extra restart
+    eng.mode = "rotate"
+    eng._control_step(100.0)
+    assert begun == []
+
+    eng.mode = "off"
+    eng._control_step(100.0)
+    assert begun == [(7, "temperature update")]
+
+
+def test_worker_osd_vf_filter(monkeypatch):
     monkeypatch.setattr(se, "find_tool", lambda cfg, name: name)
-    monkeypatch.setattr(se, "LOG_DIR", tmp_path)
     monkeypatch.setattr(se, "probe", lambda cfg, ffprobe, ch, timeout=10: {
         "ok": True, "reason": "", "video": "h264", "audio": None, "width": 1920, "height": 1080
     })
@@ -253,7 +273,7 @@ def test_worker_osd_vf_filter(monkeypatch, tmp_path):
     cfg["osd"]["show_temp"] = "true"
 
     eng = se.Engine(cfg)
-    eng.osd_file = tmp_path / "osd_time_temp.txt"
+    eng.current_temp = "28°C"
     worker = se.InputSource(eng, 1)
 
     import time
@@ -264,8 +284,11 @@ def test_worker_osd_vf_filter(monkeypatch, tmp_path):
 
     assert len(captured_cmds) == 1
     vf_arg = captured_cmds[0][captured_cmds[0].index("-vf") + 1]
-    assert "textfile=" in vf_arg
-    assert "reload=1" in vf_arg
+    assert "text='%{localtime}  ·  28°C'" in vf_arg
+    # reload= would let a swapped file kill the camera feed
+    assert "textfile=" not in vf_arg
+    assert "reload=" not in vf_arg
+    assert worker.osd_temp == "28°C"
 
 
 def test_muted_channels_roundtrip(tmp_path: Path):
