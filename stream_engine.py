@@ -18,6 +18,7 @@ connection: viewers just see the picture change (or freeze on the last frame).
 
 from __future__ import annotations
 
+import array
 import configparser
 import json
 import logging
@@ -73,7 +74,8 @@ DEFAULTS = {
     "switching": {"channel": "7", "mode": "off", "rotate_seconds": "30",
                   "auto_channels": "1,2,3,4,5,6,7,8", "failover_after": "10",
                   "failback_seconds": "60"},
-    "audio": {"enabled": "true", "muted_channels": ""},
+    "audio": {"enabled": "true", "muted_channels": "", "music_path": "music",
+              "music_mode": "mix", "music_volume": "0.3"},
     "osd": {"enabled": "false", "show_channel": "true", "show_time": "true",
             "show_temp": "true", "weather_location": "auto", "font_size": "22"},
     "tools": {"ffmpeg": "", "ffprobe": ""},
@@ -124,9 +126,15 @@ failover_after   = {switching[failover_after]}
 failback_seconds = {switching[failback_seconds]}
 
 [audio]
-enabled = {audio[enabled]}
-# Channels whose camera audio is replaced by silence, comma-separated (e.g. 3,5).
+enabled        = {audio[enabled]}
+# Channels whose camera audio is replaced by silence/music, comma-separated (e.g. 3,5).
 muted_channels = {audio[muted_channels]}
+# Background music: path to an audio file (.mp3, .wav, etc.) or music directory.
+music_path     = {audio[music_path]}
+# "mix" (play softly with camera) or "fallback" (play only when camera is silent/muted)
+music_mode     = {audio[music_mode]}
+# Volume level from 0.0 to 1.0
+music_volume   = {audio[music_volume]}
 
 [osd]
 # Burn camera label, live clock, and live weather temperature into the video stream (true | false)
@@ -586,6 +594,139 @@ class InputSource:
 
 
 # --------------------------------------------------------------------------- #
+# Background Music & Audio Mixing
+# --------------------------------------------------------------------------- #
+def mix_pcm(cam_chunk: bytes, music_chunk: bytes, music_vol: float) -> bytes:
+    """Mix camera PCM with background music PCM (s16le stereo 44.1 kHz)."""
+    if not music_chunk or music_vol <= 0.0:
+        return cam_chunk or SILENCE
+    if not cam_chunk or cam_chunk == SILENCE:
+        if abs(music_vol - 1.0) < 0.01:
+            return music_chunk
+        m = array.array("h", music_chunk)
+        for i in range(len(m)):
+            m[i] = int(m[i] * music_vol)
+        return m.tobytes()
+
+    c = array.array("h", cam_chunk)
+    m = array.array("h", music_chunk)
+    n = min(len(c), len(m))
+    for i in range(n):
+        val = int(c[i] + m[i] * music_vol)
+        c[i] = 32767 if val > 32767 else (-32768 if val < -32768 else val)
+    return c.tobytes()
+
+
+class MusicSource:
+    """Background music decoder that supplies 44.1 kHz s16le stereo PCM in an endless loop."""
+
+    SUPPORTED_EXTS = (".mp3", ".wav", ".aac", ".m4a", ".ogg", ".flac", ".wma", ".opus")
+
+    def __init__(self, engine: "Engine"):
+        self.engine = engine
+        self._proc: subprocess.Popen | None = None
+        self._tracks: list[Path] = []
+        self._track_idx = 0
+        self._lock = threading.Lock()
+        self._stopped = False
+        self.reload_tracks()
+
+    def reload_tracks(self) -> None:
+        """Scan configured music path for audio files."""
+        with self._lock:
+            raw = self.engine.cfg["audio"].get("music_path", "").strip()
+            self._tracks = []
+            if not raw:
+                return
+            p = Path(raw)
+            if not p.is_absolute():
+                p = APP_DIR / p
+            if p.is_file() and p.suffix.lower() in self.SUPPORTED_EXTS:
+                self._tracks = [p]
+            elif p.is_dir():
+                found = [f for f in p.iterdir() if f.is_file() and f.suffix.lower() in self.SUPPORTED_EXTS]
+                self._tracks = sorted(found)
+            self._track_idx = 0
+
+    def start(self) -> None:
+        self._stopped = False
+        self._next_track()
+
+    def _next_track(self) -> None:
+        if self._proc:
+            try:
+                self._proc.kill()
+                self._proc.wait(timeout=1)
+            except Exception:
+                pass
+            self._proc = None
+
+        if not self._tracks or self._stopped:
+            return
+
+        track = self._tracks[self._track_idx % len(self._tracks)]
+        self._track_idx += 1
+
+        cmd = [
+            self.engine.ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-i", str(track),
+            "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS),
+            "pipe:1"
+        ]
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW
+            )
+            log.info("Background music playing: %s", track.name)
+        except Exception as e:
+            log.warning("Could not start background music (%s): %s", track.name, e)
+            self._proc = None
+
+    def pop_chunk(self, size: int) -> bytes | None:
+        """Return exactly `size` bytes of decoded PCM audio, or None if no music."""
+        with self._lock:
+            if not self._tracks or self._stopped:
+                return None
+            if not self._proc or self._proc.poll() is not None:
+                self._next_track()
+                if not self._proc:
+                    return None
+
+            buf = bytearray()
+            while len(buf) < size and self._proc:
+                needed = size - len(buf)
+                try:
+                    data = self._proc.stdout.read(needed)
+                except Exception:
+                    data = None
+
+                if not data:
+                    self._next_track()
+                    if not self._proc:
+                        break
+                    continue
+                buf.extend(data)
+
+            if not buf:
+                return None
+            if len(buf) < size:
+                buf.extend(bytes(size - len(buf)))
+            return bytes(buf)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+            if self._proc:
+                try:
+                    self._proc.kill()
+                    self._proc.wait(timeout=1)
+                except Exception:
+                    pass
+                self._proc = None
+
+
+# --------------------------------------------------------------------------- #
 # Output: one persistent connection to YouTube
 # --------------------------------------------------------------------------- #
 class OutputSink:
@@ -744,8 +885,12 @@ class Engine:
         self.auto_channels = parse_channels(sw.get("auto_channels", ""))
         self.failover_after = max(3, sw.getint("failover_after", 10))
         self.failback_seconds = max(10, sw.getint("failback_seconds", 60))
-        self.audio_enabled = cfg["audio"].getboolean("enabled", True)
-        self.muted_channels = set(parse_channels(cfg["audio"].get("muted_channels", "")))
+        aud = cfg["audio"]
+        self.audio_enabled = aud.getboolean("enabled", True)
+        self.muted_channels = set(parse_channels(aud.get("muted_channels", "")))
+        self.music_mode = aud.get("music_mode", "mix").lower()
+        self.music_volume = max(0.0, min(1.0, aud.getfloat("music_volume", 0.3)))
+        self.music = MusicSource(self)
 
         self.audio_cache: dict[int, bool] = {}      # channel -> has an audio track
         self.channel_health: dict[int, str] = {}    # channel -> "ok" | "fail"
@@ -774,6 +919,7 @@ class Engine:
                  if self.muted_channels else "", *self.canvas, self.fps)
         for target in (self._control_loop, self._sink_loop, self._video_writer, self._audio_writer):
             threading.Thread(target=target, daemon=True, name=target.__name__).start()
+        self.music.start()
         osd = self.cfg["osd"] if self.cfg.has_section("osd") else {}
         osd_on = osd.get("enabled", "false").lower() in ("true", "1", "yes")
         show_temp = osd.get("show_temp", "true").lower() in ("true", "1", "yes")
@@ -783,6 +929,8 @@ class Engine:
 
     def stop(self) -> None:
         self.running = False
+        if self.music:
+            self.music.stop()
         for src in (self.pending, self.active):
             if src:
                 src.stop()
@@ -810,6 +958,23 @@ class Engine:
     def audio_muted(self, ch: int | None) -> bool:
         """True when the given on-air channel must send silence instead of its audio."""
         return not self.audio_enabled or ch in self.muted_channels
+
+    def set_music_mode(self, mode: str) -> None:
+        self.music_mode = mode
+        self.cfg["audio"]["music_mode"] = mode
+        log.info("Background music mode set to: %s", mode)
+
+    def set_music_volume(self, vol: float) -> None:
+        self.music_volume = max(0.0, min(1.0, vol))
+        self.cfg["audio"]["music_volume"] = str(self.music_volume)
+        log.info("Background music volume set to: %.2f", self.music_volume)
+
+    def set_music_path(self, path: str) -> None:
+        self.cfg["audio"]["music_path"] = path
+        self.music.reload_tracks()
+        if self.running:
+            self.music.start()
+        log.info("Background music path set to: %s", path)
 
     def set_switching(self, mode: str, rotate_seconds: int, channels: list[int]) -> None:
         changed = mode != self.mode
@@ -1076,11 +1241,26 @@ class Engine:
             if delay > 0:
                 time.sleep(delay)
             a = self.active
-            data = a.pop_audio(AUDIO_CHUNK) if a and a.has_audio else None
-            if data is None or self.audio_muted(a.channel if a else None):
-                data = SILENCE   # popping anyway keeps the camera's buffer fresh
+            cam_data = a.pop_audio(AUDIO_CHUNK) if a and a.has_audio else None
+            is_muted = self.audio_muted(a.channel if a else None)
+
+            if not self.audio_enabled:
+                final_data = SILENCE
+            else:
+                music_chunk = self.music.pop_chunk(AUDIO_CHUNK) if self.music else None
+                if is_muted or cam_data is None:
+                    if music_chunk:
+                        final_data = mix_pcm(SILENCE, music_chunk, self.music_volume)
+                    else:
+                        final_data = SILENCE
+                else:
+                    if self.music_mode == "mix" and music_chunk:
+                        final_data = mix_pcm(cam_data, music_chunk, self.music_volume)
+                    else:
+                        final_data = cam_data
+
             try:
-                s.write_audio(data)
+                s.write_audio(final_data)
             except OSError as e:
                 s.fail(f"audio socket closed ({e})")
             k += 1
@@ -1100,6 +1280,9 @@ def main() -> None:
     parser.add_argument("--rotate-seconds", type=int, help="Rotation period in seconds")
     parser.add_argument("--no-audio", action="store_true", help="Force mute / stream silence")
     parser.add_argument("--mute-channels", help="Comma-separated channels to stream without audio")
+    parser.add_argument("--music-path", help="Path to audio file or directory for background music")
+    parser.add_argument("--music-mode", choices=["mix", "fallback"], help="Background music mode (mix or fallback)")
+    parser.add_argument("--music-volume", type=float, help="Background music volume (0.0 to 1.0)")
     parser.add_argument("--no-temp", action="store_true", help="Disable temperature overlay in OSD")
     parser.add_argument("--weather-location", help="Weather location (city name, lat,lon, or 'auto')")
     parser.add_argument("--probe", action="store_true", help="Probe all channels and exit")
@@ -1119,6 +1302,12 @@ def main() -> None:
         cfg["audio"]["enabled"] = "false"
     if args.mute_channels is not None:
         cfg["audio"]["muted_channels"] = ",".join(map(str, parse_channels(args.mute_channels)))
+    if args.music_path is not None:
+        cfg["audio"]["music_path"] = args.music_path
+    if args.music_mode is not None:
+        cfg["audio"]["music_mode"] = args.music_mode
+    if args.music_volume is not None:
+        cfg["audio"]["music_volume"] = str(args.music_volume)
     if args.no_temp:
         if not cfg.has_section("osd"):
             cfg.add_section("osd")

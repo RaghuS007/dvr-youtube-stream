@@ -320,3 +320,69 @@ def test_engine_channel_mute(monkeypatch):
     # The global switch overrides per-channel settings
     eng.set_audio(False)
     assert eng.audio_muted(2)
+
+
+def test_mix_pcm():
+    import array
+    # Silence + music at 50%
+    music = array.array("h", [1000, -2000, 3000]).tobytes()
+    res = se.mix_pcm(se.SILENCE, music, 0.5)
+    res_arr = array.array("h", res)
+    assert list(res_arr[:3]) == [500, -1000, 1500]
+
+    # Camera + music at 50%
+    cam = array.array("h", [500, 1000, -500]).tobytes()
+    res2 = se.mix_pcm(cam, music, 0.5)
+    res2_arr = array.array("h", res2)
+    assert list(res2_arr) == [1000, 0, 1000]
+
+    # Clipping check
+    loud_cam = array.array("h", [32000, -32000]).tobytes()
+    loud_music = array.array("h", [10000, -10000]).tobytes()
+    res_clip = se.mix_pcm(loud_cam, loud_music, 1.0)
+    assert list(array.array("h", res_clip)) == [32767, -32768]
+
+
+def test_music_source_reload(tmp_path):
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.read_dict(se.DEFAULTS)
+    eng = types.SimpleNamespace(cfg=cfg, ffmpeg="ffmpeg")
+
+    cfg["audio"]["music_path"] = ""
+    ms = se.MusicSource(eng)
+    assert ms._tracks == []
+
+    # Point to a directory with audio files and ignore non-audio
+    (tmp_path / "song1.mp3").write_text("dummy")
+    (tmp_path / "song2.wav").write_text("dummy")
+    (tmp_path / "notes.txt").write_text("dummy")
+
+    cfg["audio"]["music_path"] = str(tmp_path)
+    ms.reload_tracks()
+    assert len(ms._tracks) == 2
+    assert ms._tracks[0].name == "song1.mp3"
+    assert ms._tracks[1].name == "song2.wav"
+
+    # Single file
+    cfg["audio"]["music_path"] = str(tmp_path / "song1.mp3")
+    ms.reload_tracks()
+    assert len(ms._tracks) == 1
+    assert ms._tracks[0].name == "song1.mp3"
+
+
+def test_music_settings_roundtrip(tmp_path: Path):
+    test_ini = tmp_path / "test_config.ini"
+    cfg = se.load_settings(test_ini)
+    assert cfg["audio"]["music_path"] == "music"
+    assert cfg["audio"]["music_mode"] == "mix"
+    assert cfg["audio"]["music_volume"] == "0.3"
+
+    cfg["audio"]["music_path"] = "my_tracks"
+    cfg["audio"]["music_mode"] = "fallback"
+    cfg["audio"]["music_volume"] = "0.6"
+    se.save_settings(cfg, test_ini)
+
+    reloaded = se.load_settings(test_ini)
+    assert reloaded["audio"]["music_path"] == "my_tracks"
+    assert reloaded["audio"]["music_mode"] == "fallback"
+    assert reloaded["audio"]["music_volume"] == "0.6"

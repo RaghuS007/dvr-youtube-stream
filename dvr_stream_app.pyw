@@ -379,6 +379,9 @@ class SettingsDialog(tk.Toplevel):
         ("osd", "enabled", "Burn camera name/clock on stream (OSD)", "combo", ["false", "true"]),
         ("osd", "show_temp", "Show temperature on OSD (°C)", "combo", ["true", "false"]),
         ("osd", "weather_location", "Weather location (city, lat,lon, or auto)", "entry", None),
+        ("audio", "music_path", "Background music path (file or folder)", "entry", None),
+        ("audio", "music_mode", "Music mode (mix or fallback)", "combo", ["mix", "fallback"]),
+        ("audio", "music_volume", "Music volume (0.0 to 1.0)", "combo", ["0.1", "0.2", "0.3", "0.5", "0.7", "1.0"]),
         ("switching", "failover_after", "Channel fails after (s without video)", "entry", None),
         ("switching", "failback_seconds", "Failover: retry main channel every (s)", "entry", None),
     ]
@@ -395,13 +398,20 @@ class SettingsDialog(tk.Toplevel):
         for i, (sec, key, label, kind, opts) in enumerate(self.FIELDS):
             ttk.Label(frm, text=label).grid(row=i, column=0, sticky="w", pady=3, padx=(0, 10))
             var = tk.StringVar(value=app.cfg[sec].get(key, ""))
-            if kind == "combo":
+            if (sec, key) == ("audio", "music_path"):
+                row_box = ttk.Frame(frm)
+                row_box.grid(row=i, column=1, sticky="w", pady=3)
+                w = ttk.Entry(row_box, textvariable=var, width=32)
+                w.pack(side="left")
+                ttk.Button(row_box, text="Browse…", command=self._browse_music).pack(side="left", padx=4)
+            elif kind == "combo":
                 w = ttk.Combobox(frm, textvariable=var, values=opts, width=40)
+                w.grid(row=i, column=1, sticky="w", pady=3)
             else:
                 w = ttk.Entry(frm, textvariable=var, width=43, show="•" if kind == "secret" else "")
                 if kind == "secret":
                     self.secret_entries.append(w)
-            w.grid(row=i, column=1, sticky="w", pady=3)
+                w.grid(row=i, column=1, sticky="w", pady=3)
             self.vars[(sec, key)] = var
         self.show_var = tk.BooleanVar()
         ttk.Checkbutton(frm, text="Show password and stream key", variable=self.show_var,
@@ -413,6 +423,17 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
         ttk.Button(btns, text="Save", command=self.save).pack(side="right", padx=6)
         self.grab_set()
+
+    def _browse_music(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select Music File",
+            filetypes=[("Audio Files", "*.mp3 *.wav *.aac *.m4a *.ogg *.flac *.wma *.opus"), ("All Files", "*.*")]
+        )
+        if not path:
+            path = filedialog.askdirectory(title="Or Select Music Folder")
+        if path:
+            self.vars[("audio", "music_path")].set(path)
 
     def save(self):
         vals = {k: v.get().strip() for k, v in self.vars.items()}
@@ -437,6 +458,13 @@ class SettingsDialog(tk.Toplevel):
         if cfg["encoder"]["video_codec"] != old_codec:
             cfg["encoder"]["preset"] = DEFAULT_PRESETS.get(cfg["encoder"]["video_codec"], "")
         self.app._save()
+        if self.app.engine:
+            self.app.engine.set_music_mode(cfg["audio"].get("music_mode", "mix"))
+            try:
+                self.app.engine.set_music_volume(float(cfg["audio"].get("music_volume", "0.3")))
+            except ValueError:
+                pass
+            self.app.engine.set_music_path(cfg["audio"].get("music_path", ""))
         self.destroy()
         log.info("Settings saved.")
         self.app.settings_saved(cfg["dvr"]["channels"] != old_channels)

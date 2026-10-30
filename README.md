@@ -127,6 +127,29 @@ font_size        = 22
 
 ---
 
+## 🎵 Background Music & Audio Mixing
+
+Play royalty-free background music on your stream in an endless loop:
+
+In `config.ini`:
+```ini
+[audio]
+enabled        = true
+# Comma-separated channels to stream without camera audio
+muted_channels = 5,6
+# Path to an audio file (.mp3, .wav) or music directory (music/)
+music_path     = music
+# "mix" (plays softly under camera mic) or "fallback" (plays only when camera is muted/silent)
+music_mode     = mix
+# Volume scale from 0.0 to 1.0
+music_volume   = 0.3
+```
+
+- **Looping & Playlists:** Point `music_path` to a single audio track or a directory with multiple tracks (e.g. `music/`). Tracks cycle continuously.
+- **Copyright Safety:** Download free, copyright-safe tracks from [YouTube Audio Library](https://studio.youtube.com/channel/sub_confirmation/music) or [Pixabay Music](https://pixabay.com/music/) and place them in the `music/` folder.
+
+---
+
 ## 🛡 Security & Operational Safety
 
 1. **Keep `config.ini` Private:** `config.ini` is excluded by `.gitignore` to prevent committing passwords and stream keys to Git.
